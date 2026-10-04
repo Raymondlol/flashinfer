@@ -25,6 +25,7 @@ import math
 import pytest
 import torch
 
+import flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention as varlen_module
 from flashinfer.diffusion_ops import minimax_h3_sm120_varlen_attention_fp8
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention import (
     MINIMAX_H3_HEAD_DIM,
@@ -161,6 +162,52 @@ def test_minimax_h3_sm120_varlen_attention_fp8_preallocated_output_and_device_cu
     torch.cuda.synchronize()
     assert result.data_ptr() == out.data_ptr()
     _check(out, fp32_oracle(q, k, v, cu_seqlens))
+
+
+@requires_sm120
+def test_minimax_h3_sm120_varlen_attention_fp8_plan_evicted_while_other_stream_pending() -> (
+    None
+):
+    # A cached plan's tables come from the pool of the stream that built it.  If the plan is evicted
+    # while another stream still has launches queued that read it, that stream's launches must still
+    # see the original tables, not blocks the building stream has already reused.
+    device = torch.device("cuda:0")
+    cu_seqlens = (0, 33472)
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=5, device=device
+    )
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+
+    def run(out=None):
+        return minimax_h3_sm120_varlen_attention_fp8(
+            q, k, v, cu, out, cu_seqlens_host=cu_seqlens
+        )
+
+    varlen_module._PLANS.clear()
+    builder, user = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(builder):
+        reference = run()
+    with torch.cuda.stream(user):
+        user.wait_stream(builder)
+        run()
+    torch.cuda.synchronize()
+    outs = [torch.empty_like(q) for _ in range(4)]
+    with torch.cuda.stream(user):
+        # Keep the launches below queued while the plan is evicted.
+        torch.cuda._sleep(int(1e9))
+        for out in outs:
+            run(out)
+    with torch.cuda.stream(builder):
+        # Evict the plan; the new plans' tables are allocated on ``builder``.
+        for i in range(varlen_module._MAX_PLANS + 64):
+            varlen_module._plan((0, 1 + i), 1, device)
+    pending = not user.query()
+    torch.cuda.synchronize()
+    varlen_module._PLANS.clear()
+    if not pending:
+        pytest.skip("the queued launches finished before the eviction")
+    for out in outs:
+        assert torch.equal(out, reference)
 
 
 @requires_sm120

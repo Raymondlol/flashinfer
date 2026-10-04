@@ -157,6 +157,21 @@ class MiniMaxH3VarlenPlan:
         self.seg_tile_begin = i32(seg_tile_begin)
         self.tile_table = i32(tile_table or [0, 0])
         self.unit_table = i32(unit_table or [0, 0])
+        # Streams that may have launches reading the tables: the allocating one, plus those ``_plan``
+        # has passed to ``record_stream``.
+        self._streams = {_current_stream(_device_index(device))}
+
+    def _record_stream(self, stream: torch.cuda.Stream) -> None:
+        for table in (
+            self.cu_seqlens,
+            self.seg_begin,
+            self.seg_len,
+            self.seg_tile_begin,
+            self.tile_table,
+            self.unit_table,
+        ):
+            table.record_stream(stream)
+        self._streams.add(stream.cuda_stream)
 
 
 # Most recently used segment plans (device tables) and per-(device, stream) workspace sets.  Both are
@@ -170,6 +185,13 @@ _WORKSPACES: "OrderedDict[Tuple[int, int], Dict[str, torch.Tensor]]" = OrderedDi
 
 def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
+
+
+# Raw handle of the current stream on a device (the capture stream while a graph is captured); the same
+# value as ``torch.cuda.current_stream(index).cuda_stream`` at a fraction of the host cost.
+_current_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None) or (
+    lambda index: torch.cuda.current_stream(index).cuda_stream
+)
 
 
 @functools.cache
@@ -193,6 +215,13 @@ def _plan(
         _PLANS[key] = plan
     else:
         _PLANS.move_to_end(key)
+        # An evicted plan's blocks go back to the allocating stream's pool.  On the first use from another
+        # stream, record that stream on the tables, so the allocator waits for its queued launches before
+        # reusing them.  Skipped while capturing: replays do not run on the capture stream, so there is
+        # nothing to record.
+        if _current_stream(index) not in plan._streams:
+            if not torch.cuda.is_current_stream_capturing():
+                plan._record_stream(torch.cuda.current_stream(index))
     return plan
 
 
@@ -203,7 +232,7 @@ def _workspace(index: int, name: str, numel: int, dtype: torch.dtype) -> torch.T
     the same stream; concurrent streams get their own set (no cross-stream reuse races).
     """
 
-    key = (index, torch.cuda.current_stream(index).cuda_stream)
+    key = (index, _current_stream(index))
     buffers = _WORKSPACES.get(key)
     if buffers is None:
         while len(_WORKSPACES) >= _MAX_WORKSPACE_SETS:
